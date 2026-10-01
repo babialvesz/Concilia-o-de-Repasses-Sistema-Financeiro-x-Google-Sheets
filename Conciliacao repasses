@@ -1,0 +1,620 @@
+# @title 🚀 Conciliação de Repasses (Sistema Financeiro vs. Google Sheets) — Multi-Competência
+# @markdown ---
+# @markdown ### 🔗 ID da Planilha do Google Sheets
+ID_PLANILHA = "SEU_ID_DA_PLANILHA_AQUI"  # @param {type:"string"}
+
+# @markdown ---
+# @markdown ### 🎬 Passo 1: Clique no botão de Play (▶️) à esquerda.
+# @markdown > Será exibido o botão **Escolher arquivos** para selecionar a planilha de origem em formato `.xlsx`.
+# @markdown >
+# @markdown > ℹ️ O script identifica automaticamente, para cada registro, a aba de destino
+# @markdown > com base na coluna de **Competência** do próprio arquivo de origem.
+# @markdown > Não é mais necessário informar o nome da aba manualmente.
+
+import io
+import sys
+
+import gspread
+import pandas as pd
+from google.auth import default
+from google.colab import auth, files
+
+
+# ============================================================
+# CONFIGURAÇÕES DAS COLUNAS DO GOOGLE SHEETS (abas de destino)
+# ============================================================
+
+# A contagem abaixo considera:
+# A = 1, B = 2, C = 3 ... K = 11, M = 13, R = 18
+
+COL_VALOR_SHEETS_INDEX = 11   # Coluna K - Projeção após Desconto
+COL_OB_SHEETS_INDEX = 13      # Coluna M - O.B.
+COL_EMPENHO_SHEETS_INDEX = 18 # Coluna R - Observações / Empenho
+
+# Diferença máxima aceita entre os valores.
+# Permite diferença de até R$ 0,01.
+TOLERANCIA_CENTAVOS = 0.011
+
+
+# ============================================================
+# MAPEAMENTO COMPETÊNCIA (AAAAMM) -> NOME DA ABA
+# ============================================================
+
+MESES_PT = {
+    1: "Janeiro",
+    2: "Fevereiro",
+    3: "Março",
+    4: "Abril",
+    5: "Maio",
+    6: "Junho",
+    7: "Julho",
+    8: "Agosto",
+    9: "Setembro",
+    10: "Outubro",
+    11: "Novembro",
+    12: "Dezembro",
+}
+
+# Caso alguma aba tenha um nome diferente do padrão "Competência {Mês}",
+# é possível sobrescrever aqui. Exemplo: {"202607": "Competência Julho/26"}
+MAPA_ABAS_MANUAL = {}
+
+
+def obter_aba_por_competencia(competencia):
+    """
+    Recebe uma competência no formato AAAAMM (ex: 202607) e devolve
+    o nome da aba correspondente na planilha (ex: 'Competência Julho').
+    Retorna None se não for possível identificar a aba.
+    """
+    if competencia in MAPA_ABAS_MANUAL:
+        return MAPA_ABAS_MANUAL[competencia]
+
+    if len(competencia) != 6 or not competencia.isdigit():
+        return None
+
+    mes_num = int(competencia[4:6])
+    nome_mes = MESES_PT.get(mes_num)
+
+    if not nome_mes:
+        return None
+
+    return f"Competência {nome_mes}"
+
+
+# ============================================================
+# FUNÇÕES AUXILIARES
+# ============================================================
+
+def limpar_texto_numerico(valor):
+    """
+    Padroniza valores textuais/numéricos (empenho, competência),
+    removendo o '.0' que o Excel costuma adicionar a números
+    inteiros lidos como float.
+    """
+    if pd.isna(valor):
+        return ""
+
+    texto = str(valor).strip()
+
+    if texto.lower() in ["nan", "none", "null"]:
+        return ""
+
+    if texto.endswith(".0"):
+        texto = texto[:-2]
+
+    return texto
+
+
+def converter_valor_sheets(valor):
+    """
+    Converte valores do Google Sheets para número.
+
+    Exemplos:
+    R$ 3.241.189,94 -> 3241189.94
+    3.241.189,94    -> 3241189.94
+    3241189,94      -> 3241189.94
+    """
+    if valor is None:
+        return None
+
+    texto = str(valor).strip()
+
+    if not texto:
+        return None
+
+    texto = (
+        texto
+        .replace("R$", "")
+        .replace(" ", "")
+        .replace(".", "")
+        .replace(",", ".")
+    )
+
+    try:
+        return round(float(texto), 2)
+    except (ValueError, TypeError):
+        return None
+
+
+def formatar_real(valor):
+    """
+    Formata um número no padrão brasileiro.
+    """
+    if valor is None or pd.isna(valor):
+        return "Valor inválido"
+
+    valor_formatado = f"{valor:,.2f}"
+
+    return (
+        valor_formatado
+        .replace(",", "X")
+        .replace(".", ",")
+        .replace("X", ".")
+    )
+
+
+# ============================================================
+# 1. AUTENTICAÇÃO
+# ============================================================
+
+print("🔐 1. Autenticando no Google...")
+
+try:
+    auth.authenticate_user()
+
+    credenciais, _ = default()
+    gc = gspread.authorize(credenciais)
+
+    print("✅ Autenticado com sucesso!")
+
+except Exception as erro:
+    print(f"❌ Erro durante a autenticação no Google: {erro}")
+    sys.exit()
+
+
+# ============================================================
+# 2. UPLOAD DO ARQUIVO DE ORIGEM
+# ============================================================
+
+print(
+    "\n📂 2. Clique no botão abaixo para selecionar "
+    "o arquivo de origem (.xlsx):"
+)
+
+uploaded = files.upload()
+
+if not uploaded:
+    print("❌ Nenhum arquivo foi selecionado. Processo cancelado.")
+    sys.exit()
+
+nome_arquivo_origem = list(uploaded.keys())[0]
+conteudo_arquivo = uploaded[nome_arquivo_origem]
+
+print(f"\n✅ Arquivo selecionado: {nome_arquivo_origem}")
+
+
+# ============================================================
+# 3. LEITURA DO ARQUIVO DE ORIGEM
+# ============================================================
+
+print("\n⚙️ 3. Lendo e tratando os dados do arquivo de origem...")
+
+try:
+    # Colunas esperadas no arquivo de origem (ajuste os índices
+    # conforme o layout do seu arquivo):
+    # C = O.B.                    -> índice 2
+    # E = Empenho                 -> índice 4
+    # J = Situação                -> índice 9
+    # Q = Competência da Despesa  -> índice 16
+    # W = Valor                   -> índice 22
+
+    df_origem = pd.read_excel(
+        io.BytesIO(conteudo_arquivo),
+        usecols=[2, 4, 9, 16, 22]
+    )
+
+except Exception as erro:
+    print(
+        "❌ Erro ao ler o arquivo de origem.\n"
+        "Verifique se o arquivo é um Excel válido no formato .xlsx.\n"
+        f"Detalhes: {erro}"
+    )
+    sys.exit()
+
+
+# Renomeia as colunas para facilitar o processamento
+df_origem.columns = [
+    "OB_Origem",
+    "Empenho_Origem",
+    "Situacao_Origem",
+    "Competencia_Origem",
+    "Valor_Origem"
+]
+
+
+# Limpa e padroniza os dados
+df_origem["Empenho_Origem"] = (
+    df_origem["Empenho_Origem"]
+    .apply(limpar_texto_numerico)
+)
+
+df_origem["Competencia_Origem"] = (
+    df_origem["Competencia_Origem"]
+    .apply(limpar_texto_numerico)
+)
+
+df_origem["Situacao_Origem"] = (
+    df_origem["Situacao_Origem"]
+    .fillna("")
+    .astype(str)
+    .str.strip()
+)
+
+df_origem["Valor_Origem"] = pd.to_numeric(
+    df_origem["Valor_Origem"],
+    errors="coerce"
+).round(2)
+
+
+# Remove registros sem empenho ou sem valor
+df_origem = df_origem[
+    (df_origem["Empenho_Origem"] != "") &
+    (df_origem["Valor_Origem"].notna())
+].copy()
+
+
+# Mantém somente registros com situação "Paga"
+qtd_antes_filtro = len(df_origem)
+
+df_origem = df_origem[
+    df_origem["Situacao_Origem"].str.lower() == "paga"
+].copy()
+
+print(
+    f"ℹ️ {len(df_origem)} de {qtd_antes_filtro} registros válidos "
+    "estão com Situação = 'Paga' e serão considerados."
+)
+
+
+# ============================================================
+# 4. IDENTIFICAÇÃO DA ABA DE DESTINO PARA CADA REGISTRO
+# ============================================================
+
+df_origem["Aba_Destino"] = (
+    df_origem["Competencia_Origem"]
+    .apply(obter_aba_por_competencia)
+)
+
+# Registros cuja competência veio vazia/ilegível ou cujo mês
+# não foi possível mapear para uma aba
+df_sem_aba = df_origem[df_origem["Aba_Destino"].isna()].copy()
+df_origem = df_origem[df_origem["Aba_Destino"].notna()].copy()
+
+competencias_encontradas = sorted(df_origem["Competencia_Origem"].unique())
+
+print(
+    f"\nℹ️ Competências identificadas no arquivo: "
+    f"{', '.join(competencias_encontradas)}"
+)
+
+for competencia in competencias_encontradas:
+    aba_correspondente = obter_aba_por_competencia(competencia)
+    qtd_registros = len(
+        df_origem[df_origem["Competencia_Origem"] == competencia]
+    )
+    print(
+        f"   • {competencia} -> aba '{aba_correspondente}' "
+        f"({qtd_registros} registro(s))"
+    )
+
+if not df_sem_aba.empty:
+    print(
+        f"\n⚠️ {len(df_sem_aba)} registro(s) com competência vazia, "
+        "inválida ou sem aba correspondente e que serão ignorados."
+    )
+
+
+# ============================================================
+# 5. CONEXÃO COM A PLANILHA
+# ============================================================
+
+print("\n🌐 5. Conectando à planilha do Google Sheets...")
+
+try:
+    planilha = gc.open_by_key(ID_PLANILHA)
+    print("✅ Planilha conectada com sucesso!")
+
+except Exception as erro:
+    print(
+        "❌ Erro ao acessar a planilha do Google Sheets.\n"
+        f"Detalhes: {erro}"
+    )
+    sys.exit()
+
+
+# ============================================================
+# 6. CONCILIAÇÃO POR COMPETÊNCIA / ABA
+# ============================================================
+
+resultado_geral = []
+abas_nao_encontradas = []
+
+grupos_por_aba = df_origem.groupby("Aba_Destino")
+
+for aba_destino, grupo in grupos_por_aba:
+
+    print("\n" + "=" * 75)
+    print(f"🗂️ Processando aba: {aba_destino}")
+    print("=" * 75)
+
+    # Monta o mapa de transações da origem somente com os
+    # registros desta competência
+    mapa_origem = {}
+
+    for _, registro in grupo.iterrows():
+        empenho = registro["Empenho_Origem"]
+
+        mapa_origem.setdefault(empenho, []).append({
+            "ob": registro["OB_Origem"],
+            "valor": registro["Valor_Origem"]
+        })
+
+    try:
+        aba = planilha.worksheet(aba_destino)
+        todos_dados = aba.get_all_values()
+
+    except gspread.WorksheetNotFound:
+        print(
+            f"❌ A aba '{aba_destino}' não foi encontrada na planilha.\n"
+            "Os registros desta competência não foram processados."
+        )
+        abas_nao_encontradas.append({
+            "aba": aba_destino,
+            "qtd_registros": len(grupo)
+        })
+        continue
+
+    except Exception as erro:
+        print(f"❌ Erro ao acessar a aba '{aba_destino}'.\nDetalhes: {erro}")
+        abas_nao_encontradas.append({
+            "aba": aba_destino,
+            "qtd_registros": len(grupo)
+        })
+        continue
+
+    print(f"✅ Aba encontrada. Total de linhas lidas: {len(todos_dados)}")
+
+    atualizacoes_ob = []
+    erros_valor = []
+    empenhos_nao_encontrados = []
+    valores_invalidos = []
+
+    # Linha 1 = totais/resumo
+    # Linha 2 = títulos
+    # Dados começam na linha 3
+    for indice in range(2, len(todos_dados)):
+
+        linha_dados = todos_dados[indice]
+        numero_linha_sheets = indice + 1
+
+        # Garante que a linha tenha pelo menos até a coluna R
+        if len(linha_dados) < COL_EMPENHO_SHEETS_INDEX:
+            continue
+
+        # O valor é lido da coluna K
+        valor_raw = linha_dados[COL_VALOR_SHEETS_INDEX - 1]
+
+        # O empenho é lido da coluna R
+        empenho_raw = linha_dados[COL_EMPENHO_SHEETS_INDEX - 1]
+
+        empenho_sheets = limpar_texto_numerico(empenho_raw)
+
+        if not empenho_sheets:
+            continue
+
+        valor_sheets = converter_valor_sheets(valor_raw)
+
+        if valor_sheets is None:
+            valores_invalidos.append({
+                "linha": numero_linha_sheets,
+                "empenho": empenho_sheets,
+                "valor_original": valor_raw
+            })
+            continue
+
+        transacoes_empenho = mapa_origem.get(empenho_sheets)
+
+        if not transacoes_empenho:
+            empenhos_nao_encontrados.append({
+                "linha": numero_linha_sheets,
+                "empenho": empenho_sheets,
+                "valor_sheets": valor_sheets
+            })
+            continue
+
+        # Procura, entre as transações do mesmo empenho,
+        # uma transação com valor compatível
+        indice_match = None
+        menor_diferenca = None
+
+        for indice_transacao, transacao in enumerate(transacoes_empenho):
+
+            valor_origem = transacao["valor"]
+
+            diferenca_absoluta = abs(
+                round(valor_sheets - valor_origem, 2)
+            )
+
+            if diferenca_absoluta <= TOLERANCIA_CENTAVOS:
+                indice_match = indice_transacao
+                break
+
+            if (
+                menor_diferenca is None or
+                diferenca_absoluta < menor_diferenca["diferenca_absoluta"]
+            ):
+                menor_diferenca = {
+                    "diferenca_absoluta": diferenca_absoluta,
+                    "transacao": transacao
+                }
+
+        if indice_match is not None:
+
+            # Remove a transação utilizada para evitar que uma mesma
+            # O.B. seja reaproveitada em outra linha
+            transacao_encontrada = transacoes_empenho.pop(indice_match)
+
+            celula_ob = gspread.utils.rowcol_to_a1(
+                numero_linha_sheets,
+                COL_OB_SHEETS_INDEX
+            )
+
+            ob = transacao_encontrada["ob"]
+
+            # Evita inserir valores como 12345.0 na planilha
+            if pd.isna(ob):
+                ob_formatada = ""
+            else:
+                ob_formatada = str(ob).strip()
+
+                if ob_formatada.endswith(".0"):
+                    ob_formatada = ob_formatada[:-2]
+
+            atualizacoes_ob.append({
+                "range": celula_ob,
+                "values": [[ob_formatada]]
+            })
+
+        else:
+            transacao_proxima = menor_diferenca["transacao"]
+
+            erros_valor.append({
+                "linha": numero_linha_sheets,
+                "empenho": empenho_sheets,
+                "valor_sheets": valor_sheets,
+                "valor_origem": transacao_proxima["valor"],
+                "diferenca": round(
+                    valor_sheets - transacao_proxima["valor"],
+                    2
+                )
+            })
+
+    # --------------------------------------------------------
+    # Atualização da coluna M nesta aba
+    # --------------------------------------------------------
+
+    if atualizacoes_ob:
+
+        print(
+            f"\n📝 Atualizando {len(atualizacoes_ob)} "
+            "O.B.s na coluna M..."
+        )
+
+        try:
+            aba.batch_update(
+                atualizacoes_ob,
+                value_input_option="USER_ENTERED"
+            )
+
+            print("✅ Ordens Bancárias inseridas com sucesso!")
+
+        except Exception as erro:
+            print(
+                "❌ O cruzamento foi realizado, mas ocorreu um erro "
+                "ao atualizar esta aba.\n"
+                f"Detalhes: {erro}"
+            )
+
+    else:
+        print("\nℹ️ Nenhuma O.B. foi encontrada para atualização nesta aba.")
+
+    # --------------------------------------------------------
+    # Resumo da aba
+    # --------------------------------------------------------
+
+    print(f"\n📊 Resumo da aba '{aba_destino}':")
+    print(f"   ✔️ O.B.s atualizadas: {len(atualizacoes_ob)}")
+    print(f"   ⚠️ Divergências de valor: {len(erros_valor)}")
+    print(f"   ❓ Empenhos não encontrados: {len(empenhos_nao_encontrados)}")
+    print(f"   🚫 Valores inválidos na coluna K: {len(valores_invalidos)}")
+
+    if erros_valor:
+        print("\n   🚨 Divergências de valor:")
+        for erro in erros_valor:
+            print(
+                f"      • Linha {erro['linha']} | Empenho: {erro['empenho']} | "
+                f"Sheets: R$ {formatar_real(erro['valor_sheets'])} | "
+                f"Origem: R$ {formatar_real(erro['valor_origem'])} | "
+                f"Diferença: R$ {formatar_real(erro['diferenca'])}"
+            )
+
+    if empenhos_nao_encontrados:
+        print("\n   ❓ Empenhos não encontrados na origem (nesta competência):")
+        for erro in empenhos_nao_encontrados:
+            print(
+                f"      • Linha {erro['linha']} | Empenho: {erro['empenho']} | "
+                f"Valor na coluna K: R$ {formatar_real(erro['valor_sheets'])}"
+            )
+
+    if valores_invalidos:
+        print("\n   🚫 Linhas com valor vazio/inválido na coluna K:")
+        for erro in valores_invalidos:
+            print(
+                f"      • Linha {erro['linha']} | Empenho: {erro['empenho']} | "
+                f"Conteúdo: '{erro['valor_original']}'"
+            )
+
+    resultado_geral.append({
+        "aba": aba_destino,
+        "atualizadas": len(atualizacoes_ob),
+        "divergencias": len(erros_valor),
+        "nao_encontrados": len(empenhos_nao_encontrados),
+        "invalidos": len(valores_invalidos)
+    })
+
+
+# ============================================================
+# 7. RESUMO GERAL
+# ============================================================
+
+print("\n" + "=" * 75)
+print("📊 RESUMO GERAL DA CONCILIAÇÃO")
+print("=" * 75)
+
+if resultado_geral:
+    total_atualizadas = sum(r["atualizadas"] for r in resultado_geral)
+    total_divergencias = sum(r["divergencias"] for r in resultado_geral)
+    total_nao_encontrados = sum(r["nao_encontrados"] for r in resultado_geral)
+    total_invalidos = sum(r["invalidos"] for r in resultado_geral)
+
+    for r in resultado_geral:
+        print(
+            f"• {r['aba']}: "
+            f"✔️ {r['atualizadas']} atualizadas | "
+            f"⚠️ {r['divergencias']} divergências | "
+            f"❓ {r['nao_encontrados']} não encontrados | "
+            f"🚫 {r['invalidos']} inválidos"
+        )
+
+    print("-" * 75)
+    print(f"✔️ Total de O.B.s atualizadas: {total_atualizadas}")
+    print(f"⚠️ Total de divergências de valor: {total_divergencias}")
+    print(f"❓ Total de empenhos não encontrados: {total_nao_encontrados}")
+    print(f"🚫 Total de valores inválidos: {total_invalidos}")
+
+else:
+    print("Nenhuma aba foi processada.")
+
+if abas_nao_encontradas:
+    print("\n⚠️ Abas não encontradas na planilha (registros não processados):")
+    for item in abas_nao_encontradas:
+        print(f"   • '{item['aba']}' — {item['qtd_registros']} registro(s)")
+
+if not df_sem_aba.empty:
+    print(
+        f"\n⚠️ {len(df_sem_aba)} registro(s) de origem com competência "
+        "vazia/ilegível, não processados. Confira a coluna de competência do arquivo."
+    )
+
+print("=" * 75)
+print("\n🏁 Processo concluído.")
